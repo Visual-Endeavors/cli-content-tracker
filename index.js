@@ -61,6 +61,10 @@ if(!options.config) {
 				limitToFirstFile: false,
 				concurrency: 100
 			},
+			dropbox: {
+				accessToken: '',
+				rootPath: ''
+			},
 			airtable: {
 				api: '',
 				base: '',

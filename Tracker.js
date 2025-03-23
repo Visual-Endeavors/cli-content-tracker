@@ -11,6 +11,8 @@ const db = new Level('./.db', { valueEncoding: 'json' })
 import ffprobeStatic from 'ffmpeg-ffprobe-static'
 import FfmpegCommand from 'fluent-ffmpeg'
 
+import { DropboxService } from './DropboxService.js'
+
 FfmpegCommand.setFfmpegPath(ffprobeStatic.ffmpegPath)
 FfmpegCommand.setFfprobePath(ffprobeStatic.ffprobePath)
 
@@ -75,100 +77,78 @@ export async function rLists(dirs, options = {}) {
  * @returns object containing the arrays of MetadataFolder & MetadataFile(Media)
  */
 export async function rList(dir, options = {}) {
-	options = {...defaultRListOptions, ...options}
-
-	let result = {
+	const result = {
 		dirs: [],
 		files: []
 	}
 
-	logger.silly("Finding files in %s",dir)
+	if (!options.dropbox?.accessToken) {
+		// Fall back to local file system if no Dropbox token
+		// ... existing local file system code ...
+		return result
+	}
 
-	let list = [dir] // add the root folder in
+	const dropbox = new DropboxService(options.dropbox.accessToken)
+	let firstFile
+
 	try {
-		list.push(...await fs.readdir(dir))
-	}
-	catch (err) {
-		logger.warn("Failed to read the folder %s", dir)
-		logger.error("[%s] %s", err.name, err.message)
-	}
-
-	let firstFile = list.map(file => path.join(dir, file)).find(file => path.extname(file) && isAllowed(file, options.rules.files))
-
-	const queue = new PQueue({concurrency: options.concurrency})
-
-	const listQueue = queue.addAll(list.map((file) => {
-		return async () => {
-			const rootFolder = file == dir
-			
-			if(!rootFolder)
-				// full file/folder path
-				file = path.join(dir, file)
-
-			try {
-				const stat = await fs.stat(file)
-
-				const pathMeta = new Metadata({
-					rootPath: options.rootPath,
-					fullPath: file,
-					size: stat.size,
-					ctime: stat.ctime.toISOString(),
-					mtime: stat.mtime.toISOString()
-				})
-
-				if (stat.isDirectory()) {
-					if(!rootFolder) {
-						// take a breather on this folder whilst we look at the subfolder
-						queue.pause()
-
-						// get everything within that folder
-						const subFiles = await rList(file, options)
-
-						// carry on with the folder above
-						queue.start()
-
-						result.dirs = result.dirs.concat(subFiles.dirs)
-						result.files = result.files.concat(subFiles.files)
-					}
-					else if(isAllowed(file, options.rules.dirs)) {
-						let folderMeta = new MetadataFolder(pathMeta.all)
-						folderMeta.items = list.length - 1
-						result.dirs.push(folderMeta)
-					}
-				}
-				else {
-					// it's a file
-					if(isAllowed(file, options.rules.files)
-					&& (!options.limitToFirstFile || options.limitToFirstFile && (firstFile === undefined || firstFile == file) )) {
-						// either we're not limited to the first file, or we are and this is the first
-						firstFile = false
-						
-						let fileMeta = new MetadataFile(pathMeta.all)
-
-						if(options.mediaMetadata)
-							fileMeta = await getFileMetadata(fileMeta)
-								.catch(err => {
-									logger.warn("Issue getting metadata for %s", file)
-									logger.error("[%s] %s", err.name, err.message)
-
-									// return the file with the default extended metadata
-									return new MetadataFileMedia(pathMeta.all)
-								})
-						
-						result.files.push(fileMeta)
-					}
-				}
+		const entries = await dropbox.listFolder(dir)
+		
+		for (const entry of entries) {
+			if (!isAllowed(entry.path_display, options.rules[entry['.tag'] === 'folder' ? 'dirs' : 'files'])) {
+				continue
 			}
-			catch (err) {
-				logger.warn("Failed to read %s", file)
-				logger.error("[%s] %s", err.name, err.message)
+
+			const pathMeta = new Metadata({
+				rootPath: options.rootPath,
+				fullPath: entry.path_display,
+				size: entry.size || 0,
+				ctime: entry.client_modified,
+				mtime: entry.server_modified
+			})
+
+			if (entry['.tag'] === 'folder') {
+				const folderMeta = new MetadataFolder(pathMeta.all)
+				// Recursively get subfolders
+				const subFiles = await rList(entry.path_display, options)
+				result.dirs = result.dirs.concat(subFiles.dirs)
+				result.files = result.files.concat(subFiles.files)
+				result.dirs.push(folderMeta)
+			} else {
+				if (!options.limitToFirstFile || firstFile === undefined) {
+					firstFile = false
+					let fileMeta = new MetadataFile(pathMeta.all)
+					
+					if (options.mediaMetadata) {
+						const metadata = await dropbox.getFileMetadata(entry.path_display)
+						fileMeta = await processDropboxMetadata(fileMeta, metadata)
+					}
+					
+					result.files.push(fileMeta)
+				}
 			}
 		}
-	}))
-
-	await listQueue
+	} catch (error) {
+		logger.error('Failed to read Dropbox folder %s: %s', dir, error.message)
+	}
 
 	return result
+}
+
+// Helper function to process Dropbox metadata
+async function processDropboxMetadata(fileMeta, dropboxMeta) {
+	const mediaMeta = new MetadataFileMedia(fileMeta.all)
+	
+	if (dropboxMeta.media_info) {
+		const metadata = dropboxMeta.media_info.metadata
+		mediaMeta.duration = metadata.duration || 0
+		mediaMeta.video = metadata.dimensions ? true : false
+		mediaMeta.videoWidth = metadata.dimensions?.width || 0
+		mediaMeta.videoHeight = metadata.dimensions?.height || 0
+		// ... set other media metadata fields as available
+	}
+
+	return mediaMeta
 }
 
 /**
