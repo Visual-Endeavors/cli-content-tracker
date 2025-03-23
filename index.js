@@ -157,6 +157,11 @@ async function contentTracker() {
 		let foldersList, filesList = []
 		
 		try {
+			// Add the sequence issues fields to the defaults and fields lists
+			Tracker.dirDefaults.sequenceIssues = false
+			Tracker.dirDefaults.sequenceIssuesDetails = ''
+			Tracker.dirFields.push('_sequenceIssues', '_sequenceIssuesDetails')
+
 			foldersList = await Tracker.airtableToArray(foldersView, Tracker.dirDefaults)
 			const fileDefaults = config.settings.files.mediaMetadata ? Tracker.fileMediaDefaults : Tracker.fileDefaults
 			filesList = await Tracker.airtableToArray(filesView, fileDefaults)
@@ -170,6 +175,17 @@ async function contentTracker() {
 		logger.verbose("Consoling the differences between the local file system and AirTable")
 		let folderDiffs = Tracker.checkDiffs(fileList.dirs, foldersList, foldersList)
 		let fileDiffs = Tracker.checkDiffs(fileList.files, filesList, foldersList)
+
+		// Only check sequence issues for newly added folders
+		for (const dir of folderDiffs.creates) {
+			const dirPath = path.join(config.settings.files.rootPath, dir.path)
+			const files = await fs.promises.readdir(dirPath)
+			const { hasIssues, issues } = await checkSequenceIssues(dirPath, files)
+			
+			// Add sequence issues flag to directory metadata
+			dir.sequenceIssues = hasIssues
+			dir.sequenceIssuesDetails = issues
+		}
 
 		if(!options.delete) {
 			// remove all deletions
@@ -263,4 +279,53 @@ async function asyncCallWithTimeout(asyncPromise, timeLimit) {
 			clearTimeout(timeoutHandle)
 			return result
 	})
+}
+
+async function checkSequenceIssues(dir, files) {
+	let hasIssues = false
+	let issues = []
+
+	// Check for 0KB files
+	for (const file of files) {
+		const filePath = path.join(dir, file)
+		const stats = await fs.promises.stat(filePath)
+		if (stats.size === 0) {
+			hasIssues = true
+			issues.push(`0KB file: ${file}`)
+			logger.warn(`Found 0KB file: ${filePath}`)
+		}
+	}
+
+	// Check for missing sequence numbers
+	const sequenceFiles = files.filter(f => /_\d{5}$/.test(f))
+	if (sequenceFiles.length > 0) {
+		// Extract sequence numbers and sort
+		const numbers = sequenceFiles
+			.map(f => parseInt(f.match(/_(\d{5})$/)[1]))
+			.sort((a, b) => a - b)
+
+		const start = numbers[0]
+		const end = numbers[numbers.length - 1]
+		
+		// Find missing numbers in sequence
+		const missing = []
+		for (let i = start; i <= end; i++) {
+			const paddedNum = i.toString().padStart(5, '0')
+			if (!files.some(f => f.endsWith(`_${paddedNum}`))) {
+				missing.push(paddedNum)
+			}
+		}
+
+		if (missing.length > 0) {
+			hasIssues = true
+			issues.push(`Missing frames: ${missing.join(', ')}`)
+			logger.warn(`Found ${missing.length} missing frames in sequence at ${dir}:`)
+			logger.warn(`Missing frame numbers: ${missing.join(', ')}`)
+		}
+	}
+
+	return {
+		hasIssues,
+		issues: issues.join('; ')
+	}
 }
