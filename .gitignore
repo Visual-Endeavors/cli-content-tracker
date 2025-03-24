@@ -1,4 +1,8 @@
-config*.json
+# Config files with secrets
+config.json
+config.*.json
+# Dropbox token file
+.dropbox_token.json
 
 .db/
 

@@ -53,21 +53,22 @@ const defaultRListOptions = {
  * @param {object} options rules, mediaMetadata, limitToFirstFile & concurrency
  * @returns object containing the arrays of MetadataFolder & MetadataFile(Media)
  */
-export async function rLists(dirs, options = {}) {
-	options = {...defaultRListOptions, ...options}
-
-	let result = {
+export async function rLists(dirs = [], options = {}) {
+	logger.verbose('Scanning folders');
+	
+	const results = {
 		dirs: [],
 		files: []
+	};
+
+	for (const dir of dirs) {
+		const result = await rList(dir, options);  // Pass the options through
+		results.dirs.push(...result.dirs);
+		results.files.push(...result.files);
 	}
 
-	for(const dir of dirs) {
-		const fileList = await rList(dir, options)
-		result.dirs.push(...fileList.dirs)
-		result.files.push(...fileList.files)
-	}
-
-	return result
+	logger.info(`Found ${results.dirs.length} folders & ${results.files.length} files `);
+	return results;
 }
 
 /**
@@ -82,57 +83,73 @@ export async function rList(dir, options = {}) {
 		files: []
 	}
 
-	if (!options.dropbox?.accessToken) {
-		// Fall back to local file system if no Dropbox token
-		// ... existing local file system code ...
+	const ALLOWED_EXTENSIONS = ['.png', '.mov'];
+
+	logger.debug("rList called with:", {
+		dir,
+		hasDropbox: !!options.dropbox
+	})
+
+	if (!options.dropbox?.appKey) {
+		logger.warn("Missing Dropbox app key, falling back to local filesystem")
 		return result
 	}
 
-	const dropbox = new DropboxService(options.dropbox.accessToken)
-	let firstFile
-
 	try {
+		logger.debug("Initializing Dropbox service")
+		const dropbox = new DropboxService({
+			appKey: options.dropbox.appKey,
+			teamMemberEmail: options.dropbox.teamMemberEmail,
+			rootPath: options.dropbox.rootPath
+		})
+		
+		logger.debug("Starting Dropbox authentication")
+		await dropbox.init()
+		
+		logger.debug("Listing folder:", dir)
 		const entries = await dropbox.listFolder(dir)
 		
+		// Process entries with file extension filtering
 		for (const entry of entries) {
-			if (!isAllowed(entry.path_display, options.rules[entry['.tag'] === 'folder' ? 'dirs' : 'files'])) {
-				continue
-			}
-
-			const pathMeta = new Metadata({
-				rootPath: options.rootPath,
-				fullPath: entry.path_display,
-				size: entry.size || 0,
-				ctime: entry.client_modified,
-				mtime: entry.server_modified
-			})
-
+			const path = entry.path_display;
+			
 			if (entry['.tag'] === 'folder') {
-				const folderMeta = new MetadataFolder(pathMeta.all)
-				// Recursively get subfolders
-				const subFiles = await rList(entry.path_display, options)
-				result.dirs = result.dirs.concat(subFiles.dirs)
-				result.files = result.files.concat(subFiles.files)
-				result.dirs.push(folderMeta)
-			} else {
-				if (!options.limitToFirstFile || firstFile === undefined) {
-					firstFile = false
-					let fileMeta = new MetadataFile(pathMeta.all)
-					
-					if (options.mediaMetadata) {
-						const metadata = await dropbox.getFileMetadata(entry.path_display)
-						fileMeta = await processDropboxMetadata(fileMeta, metadata)
-					}
-					
-					result.files.push(fileMeta)
+				result.dirs.push({
+					path: path,
+					name: path.split('/').pop()
+				});
+			} else if (entry['.tag'] === 'file') {
+				// Check if file has allowed extension
+				const extension = path.toLowerCase().slice(path.lastIndexOf('.'));
+				if (ALLOWED_EXTENSIONS.includes(extension)) {
+					result.files.push({
+						path: entry.path_display,
+						name: entry.name,
+						size: entry.size,
+						type: extension.slice(1),
+						created: entry.client_modified,
+						modified: entry.server_modified,
+						width: entry.metadata?.dimensions?.width,
+						height: entry.metadata?.dimensions?.height,
+						duration: entry.metadata?.duration
+					});
 				}
 			}
 		}
+		
+		logger.debug(`Found ${result.dirs.length} directories and ${result.files.length} files`, {
+			dirs: result.dirs.map(d => d.path),
+			files: result.files.map(f => f.path)
+		});
+		return result
 	} catch (error) {
-		logger.error('Failed to read Dropbox folder %s: %s', dir, error.message)
+		logger.error("Dropbox error:", {
+			status: error.status,
+			message: error.message,
+			details: error.response?.data
+		})
+		return result
 	}
-
-	return result
 }
 
 // Helper function to process Dropbox metadata
@@ -395,3 +412,83 @@ export async function updateAT(diffs, table, tableName, callback) {
 	// wait for it to finish everything
 	Promise.allSettled([...proms.inserts, ...proms.updates, ...proms.deletes]).then(r => callback(tableName, error, result))
 }
+
+import Airtable from 'airtable';
+
+export async function sync(lists, config) {
+	try {
+		logger.debug('Initializing Airtable with config:', {
+			base: config.base,
+			foldersTable: config.foldersID,
+			filesMetadataTable: config.filesMetadataID
+		});
+
+		const base = new Airtable({ apiKey: config.api }).base(config.base);
+		const foldersTable = base(config.foldersID);
+		const filesTable = base(config.filesMetadataID || config.filesID);
+
+		// Sync folders
+		if (lists.dirs.length > 0) {
+			logger.debug(`Checking ${lists.dirs.length} folders for new entries`);
+			for (const dir of lists.dirs) {
+				// Check if folder already exists
+				const existingFolders = await foldersTable.select({
+					filterByFormula: `{_path} = '${dir.path}'`
+				}).firstPage();
+
+				if (existingFolders.length === 0) {
+					await foldersTable.create({
+						"_path": dir.path,
+						"_fullPath": dir.path,
+						"_ctime": dir.created,
+						"_mtime": dir.modified
+					});
+					logger.debug(`Added new folder: ${dir.path}`);
+				}
+			}
+		}
+
+		// Sync files
+		if (lists.files.length > 0) {
+			logger.debug(`Checking ${lists.files.length} files for new entries`);
+			for (const file of lists.files) {
+				// Check if file already exists
+				const existingFiles = await filesTable.select({
+					filterByFormula: `{_path} = '${file.path}'`
+				}).firstPage();
+
+				if (existingFiles.length === 0) {
+					const isPNG = file.type === 'png';
+					const isMOV = file.type === 'mov';
+
+					await filesTable.create({
+						"_path": file.path,
+						"_fullPath": file.path,
+						"_size": file.size,
+						"_ctime": file.created,
+						"_mtime": file.modified,
+						"_duration": file.duration,
+						"_videoWidth": file.width,
+						"_videoHeight": file.height,
+						"_video": isMOV,
+						"_videoStill": isPNG,
+						"_audio": isMOV
+					});
+					logger.debug(`Added new file: ${file.path}`);
+				}
+			}
+		}
+
+		logger.info(`Sync complete - added only new entries`);
+	} catch (error) {
+		logger.error('Airtable sync error:', error);
+		throw error;
+	}
+}
+
+// Make sure we export all the functions
+export default {
+	rList,
+	rLists,
+	sync
+};

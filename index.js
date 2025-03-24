@@ -100,11 +100,47 @@ let config
 
 // load config
 try {
-	config = JSON.parse(fs.readFileSync(options.config, 'utf8'))
-}
-catch (err) {
-	logger.warn("Failed to load config file")
-	logger.error("[%s] %s", err.name, err.message)
+	logger.debug("Reading config file:", options.config)
+	const rawConfig = fs.readFileSync(options.config, 'utf8')
+	logger.debug("Raw config exists:", !!rawConfig)
+	
+	config = JSON.parse(rawConfig)
+	
+	// Create tracker options with Dropbox config
+	const trackerOptions = {
+		...config.settings.files,
+		dropbox: config.settings.dropbox
+	}
+	
+	logger.debug("Tracker options:", {
+		hasDropbox: !!trackerOptions.dropbox,
+		dropboxConfig: trackerOptions.dropbox ? {
+			hasAppKey: !!trackerOptions.dropbox.appKey,
+			hasTeamMemberEmail: !!trackerOptions.dropbox.teamMemberEmail,
+			rootPath: trackerOptions.dropbox.rootPath
+		} : null,
+		dirs: config.settings.files.dirs
+	})
+
+	// Start the tracking loop
+	while (true) {
+		const lists = await Tracker.rLists(config.settings.files.dirs, trackerOptions)
+		
+		if (lists.files.length > 0 || lists.dirs.length > 0) {
+			logger.http("Attempting AirTable sync")
+			await Tracker.sync(lists, config.settings.airtable)
+		}
+
+		if (options.debug || config.settings.files.limitToFirstFile) {
+			break
+		}
+
+		await new Promise(resolve => setTimeout(resolve, config.settings.files.frequency * 1000))
+		logger.verbose("Scanning folders")
+	}
+} catch (err) {
+	logger.error("Config error:", err)
+	logger.debug("Error stack:", err.stack)
 	exit(2)
 }
 
